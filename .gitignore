@@ -1,0 +1,27 @@
+# Ignore the data science folder
+datascience/
+
+# Ignore virtual environment
+venv/
+env/
+.venv/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Dependencies & Build
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Optional log files
+*.log
+

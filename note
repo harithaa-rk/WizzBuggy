@@ -1,0 +1,3 @@
+venv/Scripts/Activate.ps1
+streamlit run novaRAG_app.py
+uvicorn novaRAG_fastapi:app --reload
