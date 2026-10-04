@@ -99,7 +99,7 @@ function ModelPane({ apiUrl, sessionId, model, result, loading, streaming }) {
   );
 }
 
-export default function ComparePanel({ apiUrl, sessionId, toast }) {
+export default function ComparePanel({ apiUrl, sessionId, toast, token }) {
   const [query, setQuery]       = useState("");
   const [modelA, setModelA]     = useState("fast");
   const [modelB, setModelB]     = useState("mistral");
@@ -130,9 +130,11 @@ export default function ComparePanel({ apiUrl, sessionId, toast }) {
       const controller = new AbortController();
       abortRef.current = controller;
 
+      const headers = { "Content-Type": "application/x-www-form-urlencoded" };
+      if (token) headers["Authorization"] = token;
       const res = await fetch(`${apiUrl}/query`, {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        headers,
         body: form.toString(),
         signal: controller.signal,
       });

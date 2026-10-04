@@ -1,6 +1,14 @@
+const CLEARANCE_COLORS = {
+  PUBLIC:       "#30d0b0",
+  INTERNAL:     "#5b6af0",
+  CONFIDENTIAL: "#f0a030",
+  RESTRICTED:   "#e05080",
+};
+
 export default function Sidebar({
   open, files, onClear, onDeleteFile,
   sessions, activeId, onNewSession, onSwitch, onDelete,
+  userRole, userClearance,
 }) {
   const getIcon = (filename) => {
     const ext = filename?.split(".").pop()?.toLowerCase();
@@ -10,6 +18,12 @@ export default function Sidebar({
   const formatDate = (ts) => new Date(ts).toLocaleDateString(undefined, {
     month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
   });
+
+  const canDelete = (f) => {
+    if (userRole === "admin") return true;
+    if (userRole === "manager") return true;
+    return false;
+  };
 
   return (
     <aside className={"sidebar" + (open ? "" : " closed")}>
@@ -22,22 +36,45 @@ export default function Sidebar({
         {files.length === 0 ? (
           <div className="no-files">No files indexed yet.</div>
         ) : (
-          files.map((f) => (
-            <div className="file-item" key={f.file}>
-              <span className="file-icon">{getIcon(f.file)}</span>
-              <div className="file-info">
-                <div className="file-name" title={f.file}>{f.file}</div>
-                <div className="file-chunks">{f.chunks} chunks</div>
+          files.map((f) => {
+            const cls = f.classification || "INTERNAL";
+            const color = CLEARANCE_COLORS[cls] || "var(--text-muted)";
+            return (
+              <div className="file-item" key={f.file}>
+                <span className="file-icon">{getIcon(f.file)}</span>
+                <div className="file-info">
+                  <div className="file-name" title={f.file}>{f.file}</div>
+                  <div style={{ display: "flex", gap: "6px", alignItems: "center", marginTop: "2px" }}>
+                    <span className="file-chunks">{f.chunks} chunks</span>
+                    <span
+                      style={{
+                        fontSize: "9px",
+                        padding: "1px 5px",
+                        borderRadius: "3px",
+                        fontWeight: 600,
+                        color: color,
+                        border: `1px solid ${color}44`,
+                        background: `${color}15`,
+                        letterSpacing: "0.5px",
+                        textTransform: "uppercase"
+                      }}
+                    >
+                      {cls}
+                    </span>
+                  </div>
+                </div>
+                {canDelete(f) && (
+                  <button
+                    className="file-del-btn"
+                    title={"Delete " + f.file}
+                    onClick={() => onDeleteFile(f.file)}
+                  >
+                    ✕
+                  </button>
+                )}
               </div>
-              <button
-                className="file-del-btn"
-                title={"Delete " + f.file}
-                onClick={() => onDeleteFile(f.file)}
-              >
-                ✕
-              </button>
-            </div>
-          ))
+            );
+          })
         )}
       </div>
 

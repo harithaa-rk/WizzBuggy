@@ -8,7 +8,7 @@ import { exportAsMarkdown, exportAsText, exportAsJSON } from "../utils/exportCha
 
 export default function ChatPanel({
   apiUrl, history, setHistory, toast,
-  sessionId, sessionName, chatInputRef, micToggleRef,
+  sessionId, sessionName, chatInputRef, micToggleRef, token,
 }) {
   const [input, setInput]         = useState("");
   const [loading, setLoading]     = useState(false);
@@ -87,9 +87,11 @@ export default function ChatPanel({
       const controller = new AbortController();
       abortRef.current = controller;
 
+      const headers = { "Content-Type": "application/x-www-form-urlencoded" };
+      if (token) headers["Authorization"] = token;
       const res = await fetch(`${apiUrl}/query`, {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        headers,
         body: form.toString(),
         signal: controller.signal,
       });

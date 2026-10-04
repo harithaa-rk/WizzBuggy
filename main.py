@@ -11,7 +11,8 @@ import uuid
 import faiss
 import whisper
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Header, Request, status
+from pydantic import BaseModel
 import json
 #from transformers import pipeline
 from PIL import Image
@@ -30,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from transformers import CLIPProcessor, CLIPModel
 import torch
 import requests
-from typing import Any
+from typing import Any, Optional, List, Dict, Union
 from collections import Counter
 
 from fastapi.responses import StreamingResponse
@@ -39,6 +40,14 @@ import asyncio
 from novarag_memory import (
     append_turn, get_turns, clear_session, MAX_MEMORY_TURNS,
     lookup_semantic_cache, store_semantic_cache, clear_semantic_cache, get_semantic_cache_stats
+)
+from novarag_auth import (
+    authenticate_user, register_user, get_user_from_token, revoke_token,
+    list_all_users, update_user_profile, delete_user, admin_reset_password,
+    get_all_document_classifications, get_document_classification,
+    set_document_classification, delete_document_classification,
+    get_allowed_filenames_for_user, check_clearance, sync_existing_files,
+    get_audit_logs, clear_audit_logs, log_audit, MAX_INGEST_CLEARANCE, CLEARANCE_RANKS
 )
 
 # ================= STRICT THRESHOLDS & CACHE CONFIG =================
@@ -110,16 +119,46 @@ STRICT RULES:
 6) Never add information beyond what the context contains
 """
 # ================= INIT =================
-app = FastAPI()
+app = FastAPI(title="NovaRAG Enterprise Knowledge Vault", description="Confidential Multimodal RAG with RBAC")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# ── Authentication & RBAC Dependencies ──
+def get_current_user_required(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication token required. Please log in."
+        )
+    user = get_user_from_token(authorization)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session has expired or is invalid. Please log in again."
+        )
+    return user
+
+def get_current_user_optional(authorization: Optional[str] = Header(None)) -> Optional[Dict[str, Any]]:
+    if not authorization:
+        return None
+    return get_user_from_token(authorization)
+
+def require_admin(current_user: Dict[str, Any] = Depends(get_current_user_required)) -> Dict[str, Any]:
+    if current_user.get("role") != "admin":
+        log_audit(current_user.get("username", "unknown"), "ACCESS_DENIED", "Attempted access to admin-restricted resource", "DENIED")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: Organization Administrator role required."
+        )
+    return current_user
 
 
 #---- LLM + EMBEDDING CONFIG FIRST
@@ -219,6 +258,14 @@ chunk_hashes = set(
     hashlib.sha256(str(m.get("text", "")).strip().encode()).hexdigest()
     for m in metadata_store
 )
+
+# -------- SYNC EXISTING FILES WITH CONFIDENTIALITY CLASSIFICATIONS --------
+try:
+    _existing_file_list = list(set(m["path"] for m in metadata_store if "path" in m))
+    sync_existing_files(_existing_file_list)
+    print(f"🔒 Synced {len(_existing_file_list)} files with confidentiality classification matrix.")
+except Exception as _e:
+    print("Warning: failed to sync initial file classifications:", _e)
 
 def call_llm(prompt: str, model_choice: str) -> str:
     # Fix: always assign model_name
@@ -493,7 +540,7 @@ def add_chunks_batch(chunks: list, filename: str, page=None, start_chunk_id=0, b
 
 #----- HYBRID SEARCH (FAISS + BM25) ----
 
-def hybrid_search(query, k=5, image_path=None, file_filter=None):
+def hybrid_search(query, k=5, image_path=None, file_filter=None, allowed_files: Optional[set] = None):
     
     if text_index.ntotal == 0:
         return []
@@ -570,22 +617,35 @@ def hybrid_search(query, k=5, image_path=None, file_filter=None):
     # Sort by hybrid score
     sorted_indices = sorted(combined.items(), key=lambda x: x[1], reverse=True)
 
-    # Build final results
+    # Build final results with confidentiality tag
+    classifications = get_all_document_classifications()
     results = []
     for idx, final_score in sorted_indices[:k]:
         item = metadata_store[idx]
+        doc_path = item["path"]
         results.append({
             "idx": idx,
             "snippet": item["text"],
-            "path": item["path"],
+            "path": doc_path,
             "page": item["page"],
             "chunk_id": item.get("chunk_id"),
             "score": final_score,
-            "type": item.get("type") if item.get("type") in {"text", "table", "image", "audio"} else "text"
+            "type": item.get("type") if item.get("type") in {"text", "table", "image", "audio"} else "text",
+            "classification": classifications.get(doc_path, {}).get("classification", "INTERNAL")
         })
+
+    # ── Role-based Access Filter: Enforce clearance boundaries ──
+    if allowed_files is not None:
+        results = [r for r in results if r["path"] in allowed_files]
+        image_results = [r for r in image_results if r["path"] in allowed_files]
+
+    # Explicit user file filter (supports comma-separated file names)
     if file_filter:
-        results = [r for r in results if r["path"] == file_filter]
-    print(f"Retrieved {len(results)} results")
+        filters = set(f.strip() for f in file_filter.split(",") if f.strip())
+        results = [r for r in results if r["path"] in filters]
+        image_results = [r for r in image_results if r["path"] in filters]
+
+    print(f"Retrieved {len(results)} results (allowed clearance filter: {allowed_files is not None})")
     return results + image_results
     
 
@@ -786,7 +846,31 @@ def is_image_query(q):
 # ================= INGEST =================
 
 @app.post("/ingest")
-async def ingest(file: UploadFile = File(...)):
+async def ingest(
+    file: UploadFile = File(...),
+    classification: str = Form("INTERNAL"),
+    authorization: Optional[str] = Header(None)
+):
+    current_user = get_user_from_token(authorization)
+    user_role = current_user.get("role", "employee") if current_user else "employee"
+    username = current_user.get("username", "system") if current_user else "system"
+    user_dept = current_user.get("department", "General") if current_user else "General"
+
+    if user_role == "auditor":
+        log_audit(username, "INGEST_DENIED", "Auditor account attempted document ingestion", "DENIED")
+        raise HTTPException(status_code=403, detail="Auditor accounts have read-only access and cannot ingest documents.")
+
+    classification = classification.strip().upper()
+    if classification not in CLEARANCE_RANKS:
+        classification = "INTERNAL"
+
+    max_allowed = MAX_INGEST_CLEARANCE.get(user_role, "INTERNAL")
+    if CLEARANCE_RANKS.get(classification, 1) > CLEARANCE_RANKS.get(max_allowed, 1):
+        log_audit(username, "INGEST_DENIED", f"Attempted ingestion above role limit: {classification} (max {max_allowed})", "DENIED")
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your role ({user_role}) cannot ingest files classified higher than {max_allowed}."
+        )
 
     if not file.filename:
         return {"status": "Invalid file"}
@@ -951,42 +1035,81 @@ async def ingest(file: UploadFile = File(...)):
     # Invalidate semantic cache when knowledge base is updated
     clear_semantic_cache()
 
-    return {"status": "File indexed successfully", "chunks": ingested_chunks}
+    # Record document confidentiality classification in DB
+    set_document_classification(
+        filename=file.filename,
+        classification=classification,
+        uploaded_by=username,
+        department=user_dept,
+        description=f"Ingested by {username} ({user_role})"
+    )
+    log_audit(username, "INGEST", f"Ingested '{file.filename}' as {classification} ({ingested_chunks} chunks)", "SUCCESS")
+
+    return {
+        "status": "File indexed successfully",
+        "chunks": ingested_chunks,
+        "classification": classification,
+        "uploaded_by": username
+    }
 
 # ================= ROUTES =================
 
-@app.get("/stats")        # ← already here
+@app.get("/stats")
 def stats():
-    files = len(set(m["path"] for m in metadata_store))
+    files = len(set(m["path"] for m in metadata_store if "path" in m))
     return {"total": text_index.ntotal, "files": files}
 
-#-- new route to list ingested files and their chunk counts----
+#-- list ingested files with confidentiality classification and role clearance ----
 @app.get("/files")
-def list_files():
-    file_map = {}
+def list_files(authorization: Optional[str] = Header(None)):
+    current_user = get_user_from_token(authorization)
+    all_files = list(set(m["path"] for m in metadata_store if "path" in m))
+    classifications = get_all_document_classifications()
 
+    if current_user:
+        allowed_files = get_allowed_filenames_for_user(current_user, all_files)
+    else:
+        # Default unauthenticated access: only PUBLIC files visible
+        allowed_files = {f for f in all_files if classifications.get(f, {}).get("classification") == "PUBLIC"}
+
+    file_map = {}
     for m in metadata_store:
-        fname = m["path"]
-        file_map.setdefault(fname, 0)
-        file_map[fname] += 1
+        fname = m.get("path")
+        if fname and fname in allowed_files:
+            file_map.setdefault(fname, 0)
+            file_map[fname] += 1
 
     return [
-        {"file": f, "chunks": c}
+        {
+            "file": f,
+            "chunks": c,
+            "classification": classifications.get(f, {}).get("classification", "INTERNAL"),
+            "uploaded_by": classifications.get(f, {}).get("uploaded_by", "system"),
+            "department": classifications.get(f, {}).get("department", "General"),
+        }
         for f, c in file_map.items()
     ]
 
-
-
-
-
-
 @app.get("/document/{filename}")
-def get_document(filename: str):
+def get_document(filename: str, authorization: Optional[str] = Header(None)):
     if not filename:
         return {"error": "Filename is missing"}
     safe_name = Path(filename).name   # removes ../ attacks
-    file_path = os.path.join(UPLOAD_DIR, str(safe_name))
 
+    # Check user clearance
+    current_user = get_user_from_token(authorization)
+    user_clearance = current_user.get("clearance_level", "PUBLIC") if current_user else "PUBLIC"
+    doc_class = get_document_classification(safe_name)
+
+    if not check_clearance(user_clearance, doc_class):
+        u_name = current_user.get("username", "anonymous") if current_user else "anonymous"
+        log_audit(u_name, "DOCUMENT_ACCESS_DENIED", f"Attempted download of {doc_class} document '{safe_name}'", "DENIED")
+        raise HTTPException(
+            status_code=403,
+            detail=f"Confidentiality Violation: Document '{safe_name}' requires {doc_class} clearance."
+        )
+
+    file_path = os.path.join(UPLOAD_DIR, str(safe_name))
     if os.path.exists(file_path):
         return FileResponse(file_path)
 
@@ -1131,7 +1254,32 @@ async def query(
     k: int = Form(20),
     session: str = Form("default"),
     stream: bool = Form(False),   # ← frontend sets True for streaming
+    file_filter: Optional[str] = Form(None),
+    authorization: Optional[str] = Header(None),
 ):
+    current_user = get_user_from_token(authorization)
+    all_files = list(set(m["path"] for m in metadata_store if "path" in m))
+
+    if current_user:
+        allowed_files = get_allowed_filenames_for_user(current_user, all_files)
+        username = current_user.get("username", "anonymous")
+    else:
+        # Default unauthenticated access: only PUBLIC documents allowed
+        classifications = get_all_document_classifications()
+        allowed_files = {f for f in all_files if classifications.get(f, {}).get("classification") == "PUBLIC"}
+        username = "anonymous"
+
+    # Strict check: verify user has clearance for all requested filter files
+    if file_filter:
+        requested = [f.strip() for f in file_filter.split(",") if f.strip()]
+        unauthorized = [f for f in requested if f not in allowed_files]
+        if unauthorized:
+            log_audit(username, "QUERY_DENIED", f"Unauthorized query attempt on confidential files: {unauthorized}", "DENIED")
+            raise HTTPException(
+                status_code=403,
+                detail=f"Confidentiality Access Denied: Insufficient clearance for: {', '.join(unauthorized)}"
+            )
+
     model = model.strip().lower()
     q_vec = embed(q)
 
@@ -1143,12 +1291,16 @@ async def query(
         cached_cits = cached["citations"]
         cached_conf = cached["confidence"]
 
+        # Filter cached citations so no confidential source is exposed if user lacks clearance
+        cached_cits = [c for c in cached_cits if c.get("path") in allowed_files]
+
         # Append to conversational memory so multi-turn context remains continuous
         append_turn(
             question=q, answer=cached_ans, embedding=q_vec,
             file=cached_cits[0]["path"] if cached_cits else None,
             session=session
         )
+        log_audit(username, "QUERY", f"[CACHE] Query: '{q[:100]}'", "SUCCESS")
 
         if stream:
             async def cache_stream():
@@ -1183,7 +1335,7 @@ async def query(
 
     search_q = expand_query(rewritten_q)
     print(f"🔍 Search query: {search_q}")
-    docs = hybrid_search(search_q, k=k)
+    docs = hybrid_search(search_q, k=k, file_filter=file_filter, allowed_files=allowed_files)
 
     # ── 3. STRICT RETRIEVAL THRESHOLD (>= 0.50) ────────────────
     docs = [d for d in docs if float(d.get("score", 0)) >= MIN_RETRIEVAL_SCORE]
@@ -1439,11 +1591,28 @@ def query_get():
 # ================= FILE DELETE =================
 # Add this new endpoint to main.py:
 
+# ================= FILE DELETE =================
+
 @app.delete("/file/{filename}")
-def delete_file(filename: str):
+def delete_file(filename: str, authorization: Optional[str] = Header(None)):
     global bm25, text_index, metadata_store, chunk_hashes
 
+    current_user = get_user_from_token(authorization)
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required to delete indexed files.")
+
+    user_role = current_user.get("role", "employee")
+    username = current_user.get("username", "unknown")
     safe = Path(filename).name
+
+    # Check permissions: Admin can delete any file; Manager can delete their own uploaded files
+    classifications = get_all_document_classifications()
+    doc_info = classifications.get(safe, {})
+    uploader = doc_info.get("uploaded_by")
+
+    if user_role != "admin" and not (user_role == "manager" and uploader == username):
+        log_audit(username, "DELETE_DENIED", f"Unauthorized attempt to delete '{safe}'", "DENIED")
+        raise HTTPException(status_code=403, detail="Only administrators or the original manager who uploaded this file can delete it.")
 
     # 1. Remove from disk
     fp = os.path.join(UPLOAD_DIR, safe)
@@ -1486,10 +1655,12 @@ def delete_file(filename: str):
     img_keep = [im for im in image_metadata if im.get("path") != safe]
     image_metadata[:] = img_keep
 
-    # 8. Persist
+    # 8. Persist and remove from classifications
     save_database()
     clear_semantic_cache()
+    delete_document_classification(safe)
 
+    log_audit(username, "DELETE_FILE", f"Deleted '{safe}' ({len(indices_to_remove)} chunks removed)", "SUCCESS")
     print(f"🗑 Deleted '{safe}': removed {len(indices_to_remove)} chunks")
     return {
         "status": "deleted",
@@ -1503,32 +1674,45 @@ async def semantic_search(
     q: str = Form(...),
     k: int = Form(10),
     file_filter: str = Form(""),
+    authorization: Optional[str] = Header(None)
 ):
     """
     Returns raw matching chunks with scores — no LLM involved.
-    Fast keyword + semantic search across all indexed documents.
+    Enforces role-based confidentiality clearance boundaries.
     """
     if text_index.ntotal == 0:
         return {"results": [], "query": q, "total": 0}
- 
-    # Run hybrid search
-    results = hybrid_search(q, k=k, file_filter=file_filter or None)
- 
+
+    current_user = get_user_from_token(authorization)
+    all_files = list(set(m["path"] for m in metadata_store if "path" in m))
+
+    if current_user:
+        allowed_files = get_allowed_filenames_for_user(current_user, all_files)
+    else:
+        classifications = get_all_document_classifications()
+        allowed_files = {f for f in all_files if classifications.get(f, {}).get("classification") == "PUBLIC"}
+
+    # Run hybrid search with allowed_files filter
+    results = hybrid_search(q, k=k, file_filter=file_filter or None, allowed_files=allowed_files)
+
     # Sort by score
     results = sorted(results, key=lambda x: x.get("score", 0), reverse=True)
- 
+
+    classifications = get_all_document_classifications()
     # Format response
     output = []
     for r in results:
+        doc_path = r.get("path", "")
         output.append({
-            "text":     r.get("snippet", ""),
-            "path":     r.get("path", ""),
-            "page":     r.get("page"),
-            "chunk_id": r.get("chunk_id"),
-            "score":    round(float(r.get("score", 0)), 4),
-            "type":     r.get("type", "text"),
+            "text":           r.get("snippet", ""),
+            "path":           doc_path,
+            "page":           r.get("page"),
+            "chunk_id":       r.get("chunk_id"),
+            "score":          round(float(r.get("score", 0)), 4),
+            "type":           r.get("type", "text"),
+            "classification": classifications.get(doc_path, {}).get("classification", "INTERNAL"),
         })
- 
+
     return {"results": output, "query": q, "total": len(output)}
 
 # ================= SEMANTIC CACHE ROUTES =================
@@ -1542,4 +1726,219 @@ async def cache_clear():
     """Manually flushes all entries in the semantic cache."""
     clear_semantic_cache()
     return {"status": "success", "message": "Semantic cache cleared"}
+
+# ================= AUTHENTICATION & RBAC REQUEST SCHEMAS =================
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class RegisterRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+    full_name: str
+    department: Optional[str] = "General"
+    role: Optional[str] = "employee"
+
+class UserUpdateRequest(BaseModel):
+    role: Optional[str] = None
+    clearance_level: Optional[str] = None
+    department: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class PasswordResetRequest(BaseModel):
+    new_password: str
+
+class AdminCreateUserRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+    full_name: str
+    department: Optional[str] = "General"
+    role: Optional[str] = "employee"
+    clearance_level: Optional[str] = None
+
+class ClassificationUpdateRequest(BaseModel):
+    classification: str
+
+# ================= AUTHENTICATION ROUTES =================
+
+@app.post("/auth/register")
+async def api_register(req: RegisterRequest):
+    try:
+        user = register_user(
+            username=req.username,
+            email=req.email,
+            password=req.password,
+            full_name=req.full_name,
+            department=req.department or "General",
+            role=req.role or "employee"
+        )
+        auth_data = authenticate_user(req.username, req.password)
+        return {"status": "success", "user": auth_data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+@app.post("/auth/login")
+async def api_login(
+    req: Optional[LoginRequest] = None,
+    username: Optional[str] = Form(None),
+    password: Optional[str] = Form(None),
+    request: Request = None
+):
+    u = (req.username if req else None) or username
+    p = (req.password if req else None) or password
+    if not u or not p:
+        raise HTTPException(status_code=400, detail="Username and password are required.")
+
+    client_ip = request.client.host if request and request.client else "127.0.0.1"
+    try:
+        auth_data = authenticate_user(u, p, ip=client_ip)
+        return {"status": "success", "user": auth_data}
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+@app.post("/auth/logout")
+async def api_logout(authorization: Optional[str] = Header(None)):
+    if authorization:
+        revoke_token(authorization)
+    return {"status": "success", "message": "Logged out successfully"}
+
+@app.get("/auth/me")
+async def api_me(current_user: Dict[str, Any] = Depends(get_current_user_required)):
+    return {"status": "success", "user": current_user}
+
+# ================= ADMIN MANAGEMENT ROUTES (ADMIN ROLE REQUIRED) =================
+
+@app.get("/admin/users")
+async def api_admin_list_users(current_admin: Dict[str, Any] = Depends(require_admin)):
+    users = list_all_users()
+    return {"status": "success", "users": users}
+
+@app.post("/admin/users/create")
+async def api_admin_create_user(req: AdminCreateUserRequest, current_admin: Dict[str, Any] = Depends(require_admin)):
+    try:
+        user = register_user(
+            username=req.username,
+            email=req.email,
+            password=req.password,
+            full_name=req.full_name,
+            department=req.department or "General",
+            role=req.role or "employee",
+            clearance_level=req.clearance_level
+        )
+        return {"status": "success", "user": user}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.patch("/admin/users/{username}")
+async def api_admin_update_user(
+    username: str,
+    req: UserUpdateRequest,
+    current_admin: Dict[str, Any] = Depends(require_admin)
+):
+    try:
+        updated = update_user_profile(
+            target_username=username,
+            role=req.role,
+            clearance_level=req.clearance_level,
+            department=req.department,
+            is_active=req.is_active,
+            admin_username=current_admin["username"]
+        )
+        return {"status": "success", "user": updated}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/admin/users/{username}/reset-password")
+async def api_admin_reset_password(
+    username: str,
+    req: PasswordResetRequest,
+    current_admin: Dict[str, Any] = Depends(require_admin)
+):
+    try:
+        admin_reset_password(username, req.new_password, admin_username=current_admin["username"])
+        return {"status": "success", "message": f"Password reset successfully for '{username}'"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/admin/users/{username}")
+async def api_admin_delete_user(
+    username: str,
+    current_admin: Dict[str, Any] = Depends(require_admin)
+):
+    try:
+        delete_user(username, admin_username=current_admin["username"])
+        return {"status": "success", "message": f"User '{username}' deleted successfully"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/admin/documents")
+async def api_admin_documents(current_user: Dict[str, Any] = Depends(get_current_user_required)):
+    if current_user.get("role") not in ("admin", "manager"):
+        raise HTTPException(status_code=403, detail="Admin or Manager privileges required.")
+
+    classifications = get_all_document_classifications()
+    file_map = {}
+    for m in metadata_store:
+        fname = m.get("path")
+        if fname:
+            file_map.setdefault(fname, 0)
+            file_map[fname] += 1
+
+    docs = []
+    for fname, count in file_map.items():
+        meta = classifications.get(fname, {})
+        docs.append({
+            "filename":       fname,
+            "chunks":         count,
+            "classification": meta.get("classification", "INTERNAL"),
+            "uploaded_by":    meta.get("uploaded_by", "system"),
+            "department":     meta.get("department", "General"),
+            "uploaded_at":    meta.get("uploaded_at", 0),
+            "description":    meta.get("description", ""),
+        })
+
+    return {"status": "success", "documents": docs}
+
+@app.patch("/admin/documents/{filename}/classification")
+async def api_admin_update_classification(
+    filename: str,
+    req: ClassificationUpdateRequest,
+    current_admin: Dict[str, Any] = Depends(require_admin)
+):
+    target_class = req.classification.strip().upper()
+    if target_class not in CLEARANCE_RANKS:
+        raise HTTPException(status_code=400, detail=f"Invalid classification: {target_class}. Must be one of: {list(CLEARANCE_RANKS.keys())}")
+
+    set_document_classification(
+        filename=filename,
+        classification=target_class,
+        uploaded_by=current_admin["username"],
+        description=f"Classification updated by {current_admin['username']}"
+    )
+    clear_semantic_cache()
+    return {"status": "success", "filename": filename, "classification": target_class}
+
+@app.get("/admin/audit-logs")
+async def api_admin_audit_logs(
+    limit: int = 150,
+    action: Optional[str] = None,
+    user: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user_required)
+):
+    if current_user.get("role") not in ("admin", "auditor"):
+        raise HTTPException(status_code=403, detail="Admin or Auditor privileges required to view security audit logs.")
+
+    logs = get_audit_logs(limit=limit, action_filter=action, user_filter=user)
+    return {"status": "success", "logs": logs}
+
+@app.post("/admin/audit-logs/clear")
+async def api_admin_clear_audit_logs(current_admin: Dict[str, Any] = Depends(require_admin)):
+    clear_audit_logs()
+    log_audit(current_admin["username"], "CLEAR_AUDIT_LOGS", "Audit trail cleared by administrator", "SUCCESS")
+    return {"status": "success", "message": "Audit logs cleared"}
  

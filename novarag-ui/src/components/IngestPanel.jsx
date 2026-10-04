@@ -6,6 +6,13 @@ const MODELS = [
   { label: "Creative", value: "llama3",  desc: "Llama3"             },
 ];
 
+const CLASSIFICATIONS = [
+  { value: "PUBLIC",       label: "🌐 Public",       color: "#30d0b0" },
+  { value: "INTERNAL",     label: "🔵 Internal",     color: "#5b6af0" },
+  { value: "CONFIDENTIAL", label: "🟡 Confidential", color: "#f0a030" },
+  { value: "RESTRICTED",   label: "🔴 Restricted",   color: "#e05080" },
+];
+
 // Global state carriers (read by ChatPanel via DOM)
 let _model       = "fast";
 let _k           = 8;
@@ -15,12 +22,13 @@ export const getModel      = () => _model;
 export const getK          = () => _k;
 export const getFileFilter = () => _fileFilter;
 
-export default function IngestPanel({ apiUrl, onIngested, toast, activeFiles, onFilterChange }) {
+export default function IngestPanel({ apiUrl, onIngested, toast, activeFiles, onFilterChange, token, userRole }) {
   const [selectedFile, setSelectedFile] = useState(null);
   const [model, setModel]               = useState("fast");
   const [kValue, setKValue]             = useState(8);
   const [loading, setLoading]           = useState(false);
   const [dragOver, setDragOver]         = useState(false);
+  const [classification, setClassification] = useState("INTERNAL");
 
   const handleFile = (file) => { if (file) setSelectedFile(file); };
 
@@ -30,10 +38,18 @@ export default function IngestPanel({ apiUrl, onIngested, toast, activeFiles, on
     try {
       const form = new FormData();
       form.append("file", selectedFile);
-      const res  = await fetch(`${apiUrl}/ingest`, { method: "POST", body: form });
-      if (!res.ok) throw new Error("HTTP " + res.status);
+      form.append("classification", classification);
+
+      const headers = {};
+      if (token) headers["Authorization"] = token;
+
+      const res  = await fetch(`${apiUrl}/ingest`, { method: "POST", body: form, headers });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || "HTTP " + res.status);
+      }
       const data = await res.json();
-      toast("✓ " + selectedFile.name + " — " + (data.chunks ?? "?") + " chunks indexed", "success");
+      toast("✓ " + selectedFile.name + " — " + (data.chunks ?? "?") + " chunks indexed (" + (data.classification || classification) + ")", "success");
       onIngested();
       setSelectedFile(null);
     } catch (e) {
@@ -101,6 +117,22 @@ export default function IngestPanel({ apiUrl, onIngested, toast, activeFiles, on
       </div>
 
       {loading && <div className="ingest-progress"><div className="ingest-progress-fill" /></div>}
+
+      {/* Classification selector */}
+      <div className="classification-row">
+        <span className="model-label">Classification</span>
+        {CLASSIFICATIONS.map((c) => (
+          <button
+            key={c.value}
+            className={"model-btn" + (classification === c.value ? " active" : "")}
+            onClick={() => setClassification(c.value)}
+            title={c.label}
+            style={classification === c.value ? { borderColor: c.color, color: c.color } : {}}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
 
       {/* Model + depth */}
       <div className="model-row">

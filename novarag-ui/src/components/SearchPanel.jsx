@@ -118,7 +118,7 @@ function ResultCard({ result, query, apiUrl }) {
   );
 }
 
-export default function SearchPanel({ apiUrl, files }) {
+export default function SearchPanel({ apiUrl, files, token }) {
   const [query, setQuery]       = useState("");
   const [results, setResults]   = useState([]);
   const [loading, setLoading]   = useState(false);
@@ -141,9 +141,11 @@ export default function SearchPanel({ apiUrl, files }) {
       form.append("k", String(kValue));
       if (fileFilter) form.append("file_filter", fileFilter);
 
+      const headers = { "Content-Type": "application/x-www-form-urlencoded" };
+      if (token) headers["Authorization"] = token;
       const res = await fetch(`${apiUrl}/search`, {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        headers,
         body: form.toString(),
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
